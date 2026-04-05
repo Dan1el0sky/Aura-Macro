@@ -1,0 +1,5 @@
+bin/
+obj/
+temp_test/
+**/bin/
+**/obj/

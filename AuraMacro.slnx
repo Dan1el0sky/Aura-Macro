@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="AuraMacro.ConsoleUI/AuraMacro.ConsoleUI.csproj" />
+  <Project Path="AuraMacro.Core/AuraMacro.Core.csproj" />
+  <Project Path="AuraMacro.Tests/AuraMacro.Tests.csproj" />
+</Solution>
