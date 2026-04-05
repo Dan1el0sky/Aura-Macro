@@ -1,6 +1,9 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Net.Http;
+using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using AuraMacro.Core.Interfaces;
 using AuraMacro.Core.Models;
@@ -14,6 +17,7 @@ namespace AuraMacro.Core.Engine
         private readonly IOcrEngine _ocrEngine;
         private readonly VariableStore _variableStore;
         private readonly ImageMatcher _imageMatcher;
+        private static readonly HttpClient _httpClient = new HttpClient();
 
         public MacroRunner(IInputSimulator inputSimulator, IOcrEngine ocrEngine)
         {
@@ -56,9 +60,150 @@ namespace AuraMacro.Core.Engine
                         await Task.Delay(wait.Milliseconds);
                         break;
 
+                    case SaveVariableAction saveVar:
+                        _variableStore.SaveToFile(saveVar.VariableName, _variableStore.SubstituteVariables(saveVar.FilePath), saveVar.AppendToFile);
+                        break;
+
+                    case MathCalculationAction mathCalc:
+                        _variableStore.PerformMathCalculation(mathCalc.Expression, mathCalc.SaveToVariable);
+                        break;
+
+                    case WaitUntilTimeAction waitUntilTime:
+                        if (TimeSpan.TryParse(waitUntilTime.TimeOfDay, out TimeSpan targetTime))
+                        {
+                            var now = DateTime.Now.TimeOfDay;
+                            if (targetTime > now)
+                            {
+                                await Task.Delay(targetTime - now);
+                            }
+                            else
+                            {
+                                // If time already passed today, wait until tomorrow
+                                await Task.Delay(TimeSpan.FromHours(24) - now + targetTime);
+                            }
+                        }
+                        break;
+
+                    case ExecuteScriptAction execScript:
+                        Console.WriteLine($"[Runner] Executing external script: {_variableStore.SubstituteVariables(execScript.ScriptFilePath)}");
+                        // Mock implementation. In a real app, we'd load and run the WorkflowSerializer here.
+                        break;
+
+                    case MessageBoxAction msgBox:
+                        Console.WriteLine($"[Runner] MsgBox: {_variableStore.SubstituteVariables(msgBox.Title)} - {_variableStore.SubstituteVariables(msgBox.Message)}");
+                        // Mock UI interaction. Assume 'OK' or 'Yes' for testing.
+                        string result = "Yes";
+                        if (!string.IsNullOrEmpty(msgBox.SaveResultToVariable))
+                        {
+                            _variableStore.SetVariable(msgBox.SaveResultToVariable, result);
+                        }
+                        nextActionId = (result == "Yes" || result == "OK") ? msgBox.OnYesGotoId : msgBox.OnNoGotoId;
+                        if (string.IsNullOrEmpty(nextActionId)) forceStop = string.IsNullOrEmpty(msgBox.OnYesGotoId) && string.IsNullOrEmpty(msgBox.OnNoGotoId) ? false : true; // continue normally if no branches defined.
+                        break;
+
+                    case WebScraperAction webScraper:
+                        string url = _variableStore.SubstituteVariables(webScraper.Url);
+                        Console.WriteLine($"[Runner] Web Scraping: {url}");
+                        try
+                        {
+                            string webContent = await _httpClient.GetStringAsync(url);
+                            if (!string.IsNullOrEmpty(webScraper.RegexPattern))
+                            {
+                                var match = Regex.Match(webContent, webScraper.RegexPattern);
+                                if (match.Success)
+                                    webContent = match.Value;
+                                else
+                                    webContent = string.Empty;
+                            }
+                            _variableStore.SetVariable(webScraper.SaveToVariable, webContent);
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"[Runner] Web Scraping Error: {ex.Message}");
+                            _variableStore.SetVariable(webScraper.SaveToVariable, "ERROR");
+                        }
+                        break;
+
+                    case ExecuteProgramAction execProg:
+                        string progPath = _variableStore.SubstituteVariables(execProg.ProgramPath);
+                        string args = _variableStore.SubstituteVariables(execProg.Arguments);
+                        Console.WriteLine($"[Runner] Executing Program: {progPath} {args}");
+                        try {
+                            System.Diagnostics.Process.Start(progPath, args);
+                        } catch (Exception ex) {
+                            Console.WriteLine($"[Runner] Failed to start process: {ex.Message}");
+                        }
+                        break;
+
+                    case WaitForFileChangeAction waitFile:
+                        Console.WriteLine($"[Runner] Waiting for file change in {_variableStore.SubstituteVariables(waitFile.DirectoryPath)}");
+                        // Mock waiting logic
+                        await Task.Delay(100);
+                        nextActionId = waitFile.OnSuccessGotoId;
+                        if (string.IsNullOrEmpty(nextActionId)) forceStop = string.IsNullOrEmpty(waitFile.OnSuccessGotoId) ? false : true;
+                        break;
+
+                    case LlmPromptAction llmAction:
+                        string prompt = _variableStore.SubstituteVariables(llmAction.Prompt);
+                        Console.WriteLine($"[Runner] Sending prompt to {llmAction.Provider}: {prompt}");
+
+                        string llmResponse = string.Empty;
+                        try
+                        {
+                            if (llmAction.Provider.Equals("Ollama", StringComparison.OrdinalIgnoreCase))
+                            {
+                                var payload = new { model = llmAction.ModelName, prompt = prompt, stream = false };
+                                var content = new StringContent(JsonSerializer.Serialize(payload), System.Text.Encoding.UTF8, "application/json");
+                                var response = await _httpClient.PostAsync("http://localhost:11434/api/generate", content);
+                                response.EnsureSuccessStatusCode();
+                                var resultJson = await response.Content.ReadAsStringAsync();
+                                using var doc = JsonDocument.Parse(resultJson);
+                                llmResponse = doc.RootElement.GetProperty("response").GetString() ?? "";
+                            }
+                            else if (llmAction.Provider.Equals("OpenRouter", StringComparison.OrdinalIgnoreCase))
+                            {
+                                string apiKey = Environment.GetEnvironmentVariable("OPENROUTER_API_KEY") ?? "";
+                                var payload = new
+                                {
+                                    model = llmAction.ModelName,
+                                    messages = new[] { new { role = "user", content = prompt } }
+                                };
+                                var request = new HttpRequestMessage(HttpMethod.Post, "https://openrouter.ai/api/v1/chat/completions");
+                                request.Headers.Add("Authorization", $"Bearer {apiKey}");
+                                request.Content = new StringContent(JsonSerializer.Serialize(payload), System.Text.Encoding.UTF8, "application/json");
+                                var response = await _httpClient.SendAsync(request);
+                                response.EnsureSuccessStatusCode();
+                                var resultJson = await response.Content.ReadAsStringAsync();
+                                using var doc = JsonDocument.Parse(resultJson);
+                                llmResponse = doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString() ?? "";
+                            }
+                            else
+                            {
+                                llmResponse = $"[Unsupported Provider: {llmAction.Provider}] Mocked response for: {prompt}";
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"[Runner] LLM API Error: {ex.Message}");
+                            llmResponse = "ERROR: " + ex.Message;
+                        }
+
+                        _variableStore.SetVariable(llmAction.SaveToVariable, llmResponse);
+                        break;
+
+                    case AiFindObjectAction aiFind:
+                        Console.WriteLine($"[Runner] AI Find Object via {aiFind.Provider}: {_variableStore.SubstituteVariables(aiFind.Description)}");
+                        // Mock AI finding logic
+                        if (!string.IsNullOrEmpty(aiFind.SaveToVariable))
+                            _variableStore.SetVariable(aiFind.SaveToVariable, "X: 100, Y: 200");
+                        nextActionId = aiFind.OnSuccessGotoId;
+                        if (string.IsNullOrEmpty(nextActionId)) forceStop = string.IsNullOrEmpty(aiFind.OnSuccessGotoId) ? false : true;
+                        break;
+
                     case WaitForImageAction waitImg:
-                        Console.WriteLine($"[Runner] Waiting for image: {waitImg.ImagePath}");
-                        bool imgFound = _imageMatcher.FindImage("dummy_screen.png", waitImg.ImagePath, out int x, out int y);
+                        string imgPath = _variableStore.SubstituteVariables(waitImg.ImagePath);
+                        Console.WriteLine($"[Runner] Waiting for image: {imgPath}");
+                        bool imgFound = _imageMatcher.FindImage("dummy_screen.png", imgPath, out int x, out int y);
                         if (imgFound)
                         {
                             Console.WriteLine($"[Runner] Image found at {x},{y}");
@@ -74,9 +219,10 @@ namespace AuraMacro.Core.Engine
                         break;
 
                     case WaitForTextAction waitText:
-                        Console.WriteLine($"[Runner] Waiting for text: {waitText.TextToFind}");
+                        string textToFind = _variableStore.SubstituteVariables(waitText.TextToFind);
+                        Console.WriteLine($"[Runner] Waiting for text: {textToFind}");
                         string text = await _ocrEngine.RecognizeTextAsync(waitText.RegionX, waitText.RegionY, waitText.RegionWidth, waitText.RegionHeight);
-                        if (text.Contains(waitText.TextToFind))
+                        if (text.Contains(textToFind))
                         {
                             Console.WriteLine($"[Runner] Text found!");
                             if (!string.IsNullOrEmpty(waitText.SaveToVariable))
@@ -91,7 +237,8 @@ namespace AuraMacro.Core.Engine
                         break;
 
                     case IfElseAction ifElse:
-                        bool isTrue = _variableStore.EvaluateCondition(ifElse.VariableName, ifElse.ExpectedValue);
+                        string expectedVal = _variableStore.SubstituteVariables(ifElse.ExpectedValue);
+                        bool isTrue = _variableStore.EvaluateCondition(ifElse.VariableName, expectedVal);
                         nextActionId = isTrue ? ifElse.OnTrueGotoId : ifElse.OnFalseGotoId;
                         if (string.IsNullOrEmpty(nextActionId)) forceStop = true;
                         break;

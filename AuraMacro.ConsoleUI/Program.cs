@@ -6,13 +6,37 @@ using AuraMacro.Core.Mocks;
 using AuraMacro.Core.Models;
 using AuraMacro.Core.Workflow;
 
+using System.Windows.Forms;
+using System.Runtime.InteropServices;
+
 namespace AuraMacro.ConsoleUI
 {
     class Program
     {
+        [DllImport("kernel32.dll")]
+        static extern IntPtr GetConsoleWindow();
+
+        [DllImport("user32.dll")]
+        static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+        const int SW_HIDE = 0;
+        const int SW_SHOW = 5;
+
+        private static NotifyIcon? trayIcon;
+        private static bool isMinimized = false;
+
         static async Task Main(string[] args)
         {
             Console.WriteLine("=== AuraMacro Basic Testing UI ===");
+
+            // Setup Console Close Hook to prompt for Tray
+            AppDomain.CurrentDomain.ProcessExit += (s, e) => {
+                if (trayIcon != null)
+                {
+                    trayIcon.Visible = false;
+                    trayIcon.Dispose();
+                }
+            };
 
             var inputSimulator = new MockInputSimulator();
             var ocrEngine = new MockOcrEngine { MockedResult = "TEST_TEXT" };
@@ -27,7 +51,8 @@ namespace AuraMacro.ConsoleUI
                 Console.WriteLine("2. Save Macro to JSON");
                 Console.WriteLine("3. Load Macro from JSON");
                 Console.WriteLine("4. Run Macro");
-                Console.WriteLine("5. Exit");
+                Console.WriteLine("5. Minimize to Tray");
+                Console.WriteLine("6. Exit");
                 Console.Write("Select an option: ");
 
                 var input = Console.ReadLine();
@@ -64,12 +89,76 @@ namespace AuraMacro.ConsoleUI
                         Console.WriteLine("Macro finished.");
                         break;
                     case "5":
+                        MinimizeToTray();
+                        break;
+                    case "6":
                         return;
                     default:
                         Console.WriteLine("Invalid option.");
                         break;
                 }
             }
+        }
+
+        static void MinimizeToTray()
+        {
+            if (isMinimized) return;
+
+            // Run in STA thread for WinForms compatibility
+            Thread staThread = new Thread(() =>
+            {
+                var result = MessageBox.Show(
+                    "Do you want to minimize to the system tray to keep scheduled actions running using minimal resources?",
+                    "Minimize to Tray",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Question);
+
+                if (result == DialogResult.Yes)
+                {
+                    isMinimized = true;
+
+                    // Hide Console
+                    var handle = GetConsoleWindow();
+                    ShowWindow(handle, SW_HIDE);
+
+                    // Setup Tray Icon
+                    trayIcon = new NotifyIcon();
+                    trayIcon.Icon = SystemIcons.Application; // Default icon
+                    trayIcon.Text = "AuraMacro Background Engine";
+                    trayIcon.Visible = true;
+
+                    ContextMenuStrip menu = new ContextMenuStrip();
+                    var restoreItem = new ToolStripMenuItem("Restore");
+                    restoreItem.Click += (s, e) => {
+                        ShowWindow(handle, SW_SHOW);
+                        trayIcon.Visible = false;
+                        trayIcon.Dispose();
+                        isMinimized = false;
+                        Application.ExitThread(); // Fixes the deadlock
+                    };
+
+                    var exitItem = new ToolStripMenuItem("Exit");
+                    exitItem.Click += (s, e) => {
+                        trayIcon.Visible = false;
+                        trayIcon.Dispose();
+                        Environment.Exit(0);
+                    };
+
+                    menu.Items.Add(restoreItem);
+                    menu.Items.Add(exitItem);
+                    trayIcon.ContextMenuStrip = menu;
+
+                    // Run a message loop so the tray icon works
+                    Application.Run();
+                }
+                else
+                {
+                    Console.WriteLine("Minimization cancelled.");
+                }
+            });
+            staThread.SetApartmentState(ApartmentState.STA);
+            staThread.Start();
+            staThread.Join();
         }
 
         static MacroWorkflow CreateSampleWorkflow()
