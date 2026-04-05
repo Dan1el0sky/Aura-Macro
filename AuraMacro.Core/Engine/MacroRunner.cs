@@ -19,6 +19,8 @@ namespace AuraMacro.Core.Engine
         private readonly ImageMatcher _imageMatcher;
         private static readonly HttpClient _httpClient = new HttpClient();
 
+        public Action<string, string>? ShowAlertAction { get; set; }
+
         public MacroRunner(IInputSimulator inputSimulator, IOcrEngine ocrEngine)
         {
             _inputSimulator = inputSimulator;
@@ -27,7 +29,7 @@ namespace AuraMacro.Core.Engine
             _imageMatcher = new ImageMatcher();
         }
 
-        public async Task RunAsync(MacroWorkflow workflow)
+        public async Task RunAsync(MacroWorkflow workflow, System.Threading.CancellationToken cancellationToken = default)
         {
             if (workflow == null || !workflow.Actions.Any())
                 return;
@@ -37,8 +39,15 @@ namespace AuraMacro.Core.Engine
 
             while (currentAction != null)
             {
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    Console.WriteLine("[Runner] Macro cancelled.");
+                    break;
+                }
+
                 string? nextActionId = null;
                 bool forceStop = false;
+                bool actionFailed = false;
 
                 switch (currentAction)
                 {
@@ -57,7 +66,7 @@ namespace AuraMacro.Core.Engine
                         break;
 
                     case WaitAction wait:
-                        await Task.Delay(wait.Milliseconds);
+                        try { await Task.Delay(wait.Milliseconds, cancellationToken); } catch (TaskCanceledException) { forceStop = true; }
                         break;
 
                     case SaveVariableAction saveVar:
@@ -212,27 +221,50 @@ namespace AuraMacro.Core.Engine
                         else
                         {
                             Console.WriteLine($"[Runner] Image not found");
-                            nextActionId = waitImg.OnFailureGotoId;
+                            if (!string.IsNullOrEmpty(waitImg.OnFailureGotoId))
+                            {
+                                nextActionId = waitImg.OnFailureGotoId;
+                            }
+                            else
+                            {
+                                actionFailed = true;
+                            }
                         }
 
-                        if (string.IsNullOrEmpty(nextActionId)) forceStop = true;
+                        // If it succeeded but no goto id, we shouldn't force stop unless we want to, wait,
+                        // originally it was: if (string.IsNullOrEmpty(nextActionId)) forceStop = true;
+                        // But actually if an action has no next id, it falls through to the next sequential action
+                        // unless it's a branching action like IfElse where missing id means stop.
+                        // Let's refine this to use the global error handler if it failed.
                         break;
 
                     case WaitForTextAction waitText:
                         string textToFind = _variableStore.SubstituteVariables(waitText.TextToFind);
                         Console.WriteLine($"[Runner] Waiting for text: {textToFind}");
-                        string text = await _ocrEngine.RecognizeTextAsync(waitText.RegionX, waitText.RegionY, waitText.RegionWidth, waitText.RegionHeight);
-                        if (text.Contains(textToFind))
+
+                        // Apply resource throttling
+                        if (workflow.OcrCooldownMilliseconds > 0)
                         {
-                            Console.WriteLine($"[Runner] Text found!");
-                            if (!string.IsNullOrEmpty(waitText.SaveToVariable))
-                            {
-                                _variableStore.SetVariable(waitText.SaveToVariable, text);
-                            }
+                            try { await Task.Delay(workflow.OcrCooldownMilliseconds, cancellationToken); } catch (TaskCanceledException) { forceStop = true; }
                         }
-                        else
+
+                        if (!forceStop)
                         {
-                            Console.WriteLine($"[Runner] Text not found.");
+                            string text = await _ocrEngine.RecognizeTextAsync(waitText.RegionX, waitText.RegionY, waitText.RegionWidth, waitText.RegionHeight);
+                            if (text.Contains(textToFind))
+                            {
+                                Console.WriteLine($"[Runner] Text found!");
+                                if (!string.IsNullOrEmpty(waitText.SaveToVariable))
+                                {
+                                    _variableStore.SetVariable(waitText.SaveToVariable, text);
+                                }
+                            }
+                            else
+                            {
+                                Console.WriteLine($"[Runner] Text not found.");
+                                // For wait actions without explicit branch, failure means global failure
+                                actionFailed = true;
+                            }
                         }
                         break;
 
@@ -242,6 +274,32 @@ namespace AuraMacro.Core.Engine
                         nextActionId = isTrue ? ifElse.OnTrueGotoId : ifElse.OnFalseGotoId;
                         if (string.IsNullOrEmpty(nextActionId)) forceStop = true;
                         break;
+                }
+
+                if (actionFailed)
+                {
+                    if (workflow.GlobalOnFailureBehavior == FailureBehavior.Stop)
+                    {
+                        Console.WriteLine("[Runner] Action failed. Global behavior is Stop.");
+                        forceStop = true;
+                    }
+                    else if (workflow.GlobalOnFailureBehavior == FailureBehavior.AlertAndStop)
+                    {
+                        Console.WriteLine($"[Runner] Action failed. Alert: {workflow.FailureAlertMessage}");
+                        if (ShowAlertAction != null)
+                        {
+                            ShowAlertAction.Invoke(workflow.FailureAlertMessage, "Macro Failure");
+                        }
+                        else
+                        {
+                            Console.WriteLine($"[ALERT] {workflow.FailureAlertMessage}");
+                        }
+                        forceStop = true;
+                    }
+                    else if (workflow.GlobalOnFailureBehavior == FailureBehavior.Continue)
+                    {
+                        Console.WriteLine("[Runner] Action failed. Global behavior is Continue.");
+                    }
                 }
 
                 if (forceStop)
