@@ -88,10 +88,30 @@ namespace AuraMacro.Core.Windows
             }
         }
 
+        [DllImport("user32.dll")]
+        private static extern short VkKeyScan(char ch);
+
         public void SendKeyPress(string key)
         {
-            // Placeholder: Parse key string to virtual key code, send down and up
-            // Needs Virtual Key mappings
+            if (string.IsNullOrEmpty(key)) return;
+
+            // Simplified: use VkKeyScan to get virtual key code of the first char
+            short vkCode = VkKeyScan(key[0]);
+            ushort wVk = (ushort)(vkCode & 0xFF);
+
+            var inputs = new INPUT[2];
+
+            // Key Down
+            inputs[0].type = INPUT_KEYBOARD;
+            inputs[0].U.ki.wVk = wVk;
+            inputs[0].U.ki.dwFlags = 0; // KeyDown
+
+            // Key Up
+            inputs[1].type = INPUT_KEYBOARD;
+            inputs[1].U.ki.wVk = wVk;
+            inputs[1].U.ki.dwFlags = 2; // KEYEVENTF_KEYUP
+
+            SendInput(2, ref inputs[0], INPUT.Size);
         }
     }
 }
